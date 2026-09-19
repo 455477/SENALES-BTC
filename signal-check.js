@@ -20,7 +20,8 @@ const DEFAULTS = {
   sepK: 0.5, slopeN: 10, rangeN: 200,
   swingL: 5, reactK: 1, reactWindow: 12, maxAge5: 288, maxAge15: 250,
   touchTol: 0.1, stopBuf: 0.1, minStop: 0.5, minRR: 1.5, fresh: 3, use5mTargets: false,
-  riskPct: 2, capital: 1000
+  riskPct: 2, capital: 1000,
+  feePct: 0.1, btDays: 30, btGrade: 'AB', btHold: 24
 };
 
 /* ============================================================
@@ -446,12 +447,18 @@ function runAnalysis(data, P) {
 }
 
 /* ============================================================
-   Mensaje y envío a Telegram
+   Mensajes y envío a Telegram
    ============================================================ */
 const GRADE_RANK = { A: 3, B: 2, C: 1 };
+const BA_TZ = 'America/Argentina/Buenos_Aires';
+function baNow() {
+  const f = new Intl.DateTimeFormat('en-CA', { timeZone: BA_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+  const o = {}; for (const p of f.formatToParts(new Date())) o[p.type] = p.value;
+  return { date: `${o.year}-${o.month}-${o.day}`, hour: (+o.hour) % 24 };
+}
+function whenBA() { return new Date().toLocaleString('es-AR', { timeZone: BA_TZ, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }); }
 function buildMessage(A, srcInfo) {
   const sig = A.signal, p = sig.plan, buy = sig.state === 'buy';
-  const when = new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
   return [
     `${buy ? '🟢 COMPRA' : '🔴 VENTA'} BTC, calidad ${p.grade}`,
     '',
@@ -462,9 +469,33 @@ function buildMessage(A, srcInfo) {
     `Por qué: ${sig.why}`,
     p.fallback ? 'Ojo: no hay ninguna zona por delante, el objetivo es solo una referencia.' : '',
     '',
-    `Fuente: ${srcInfo.name}, precio en ${srcInfo.quote}. ${when}, hora de Buenos Aires.`,
+    `Fuente: ${srcInfo.name}, precio en ${srcInfo.quote}. ${whenBA()}, hora de Buenos Aires.`,
     'Herramienta de apoyo, no consejo financiero: la decisión es tuya.'
   ].filter((l, i, a) => l !== '' || (a[i - 1] !== '' && i !== a.length - 1)).join('\n');
+}
+function buildAlert(A) {
+  const sig = A.signal, z = sig.alertZone, buy = sig.dir === 'buy';
+  return [
+    `⚠️ ALERTA de ${buy ? 'compra' : 'venta'} en BTC (todavía NO es señal)`,
+    '',
+    `El precio (${fmt(A.price)}) está en la ${zoneName(z)} (${zoneRange(z)}).`,
+    `Falta la confirmación: ${buy ? 'martillo, envolvente alcista o cierre de 5m por encima de la zona' : 'martillo invertido, envolvente bajista o cierre de 5m por debajo de la zona'}.`,
+    '',
+    `No hagas nada todavía. Si se confirma, te aviso como señal de ${buy ? 'COMPRA' : 'VENTA'}.`
+  ].join('\n');
+}
+function buildStatus(A, srcInfo, state) {
+  const trend = { up: 'alcista', down: 'bajista', none: 'sin tendencia clara' }[A.trend.dir];
+  const word = { buy: 'hay una señal de compra', sell: 'hay una señal de venta', alert: 'hay una alerta (falta confirmación)', wait: 'no hay señal' }[A.signal.state] || 'sin señal';
+  const since = Date.now() - 24 * 3600 * 1000;
+  const rec = (state.log || []).filter(e => e.t >= since);
+  return [
+    '✅ Sigo activo y revisando el mercado.',
+    `BTC: ${fmt(A.price)} (${srcInfo.name}, ${srcInfo.quote}).`,
+    `Tendencia en 1 hora: ${trend}.`,
+    `Ahora ${word}. ${A.signal.why}`,
+    `Últimas 24 horas: ${rec.filter(e => e.type === 'signal').length} señales y ${rec.filter(e => e.type === 'alert').length} alertas enviadas.`
+  ].join('\n');
 }
 async function sendTelegram(text) {
   const token = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || process.env.TELEGRAM_TOKEN;
@@ -496,33 +527,48 @@ async function loadData() {
 }
 async function main() {
   const dry = process.env.DRY_RUN === '1';
-  if (process.env.TEST_MESSAGE === 'true') {
-    await sendTelegram('✅ Prueba: el revisor de señales de La Visión del Precio está conectado a este grupo.');
-    console.log('Mensaje de prueba enviado.'); return;
-  }
+  const out = async text => { if (dry) console.log('--- DRY RUN ---\n' + text + '\n'); else await sendTelegram(text); };
   const P = { ...DEFAULTS, fresh: 4 }; // 4 velas de 5m de vigencia: tolera demoras del cron de GitHub
   const minGrade = (process.env.MIN_GRADE || 'B').toUpperCase();
-  let state = { sent: [] };
+
+  let state = {};
   try { state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (e) { /* primera vez */ }
-  state.sent = state.sent || [];
+  state.sent = state.sent || []; state.alertIds = state.alertIds || []; state.log = state.log || [];
 
   const { src, data } = await loadData();
   const A = runAnalysis(data, P);
   if (!A) throw new Error('No hay suficientes velas para analizar');
   const sig = A.signal;
   console.log(`Fuente ${src.name}. Precio ${fmt(A.price)}. Tendencia 1h: ${A.trend.dir}. Estado: ${sig.state}.`);
-  if (sig.state !== 'buy' && sig.state !== 'sell') { console.log('Sin señal.'); return; }
+  console.log(`Motivo: ${sig.why}`);
 
-  const id = `${sig.state}|${sig.cand.z.id}|${A.c5[sig.cand.j].t}`;
-  if (state.sent.includes(id)) { console.log('Esa señal ya se avisó.'); return; }
-  if (GRADE_RANK[sig.plan.grade] < (GRADE_RANK[minGrade] || 2)) { console.log(`Señal de calidad ${sig.plan.grade}, por debajo del mínimo ${minGrade}: no se avisa.`); return; }
+  if (process.env.TEST_MESSAGE === 'true') {
+    await out('✅ Prueba: el revisor de señales de La Visión del Precio está conectado a este grupo.');
+    await out(buildStatus(A, src, state));
+    console.log('Mensajes de prueba enviados.'); return;
+  }
 
-  const msg = buildMessage(A, src);
-  if (dry) { console.log('--- DRY RUN ---\n' + msg); return; }
-  await sendTelegram(msg);
-  state.sent = [...state.sent, id].slice(-60);
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
-  console.log('Señal enviada a Telegram.');
+  let changed = false; const nowMs = Date.now();
+  const note = type => { state.log.push({ t: nowMs, type }); state.log = state.log.slice(-100); changed = true; };
+
+  if (sig.state === 'buy' || sig.state === 'sell') {
+    const id = `${sig.state}|${sig.cand.z.id}|${A.c5[sig.cand.j].t}`;
+    if (state.sent.includes(id)) console.log('Esa señal ya se avisó.');
+    else if (GRADE_RANK[sig.plan.grade] < (GRADE_RANK[minGrade] || 2)) console.log(`Señal de calidad ${sig.plan.grade}, por debajo del mínimo ${minGrade}: no se avisa.`);
+    else { await out(buildMessage(A, src)); state.sent = [...state.sent, id].slice(-60); note('signal'); console.log('Señal enviada a Telegram.'); }
+  } else if (sig.state === 'alert' && sig.alertZone && process.env.SEND_ALERTS !== '0') {
+    const id = `alert|${sig.dir}|${sig.alertZone.id}`;
+    if (state.alertIds.includes(id)) console.log('Esa alerta ya se avisó.');
+    else if ((sig.alertZone.score || 1) < 2) console.log('Alerta en una zona débil: no se avisa.');
+    else if (nowMs - (state.lastAlertAt || 0) < 60 * 60000) console.log('Ya hubo una alerta hace menos de 1 hora: no se avisa.');
+    else { await out(buildAlert(A)); state.alertIds = [...state.alertIds, id].slice(-60); state.lastAlertAt = nowMs; note('alert'); console.log('Alerta enviada a Telegram.'); }
+  } else console.log('Sin señal.');
+
+  const ba = baNow();
+  if (process.env.DAILY_STATUS !== '0' && ba.hour >= 9 && state.lastStatus !== ba.date) {
+    await out(buildStatus(A, src, state)); state.lastStatus = ba.date; changed = true; console.log('Estado diario enviado.');
+  }
+  if (changed && !dry) fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
 }
 if (require.main === module) main().catch(e => { console.error('ERROR:', e.message); process.exit(1); });
 module.exports = { runAnalysis, buildMessage, DEFAULTS, TF };
