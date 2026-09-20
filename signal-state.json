@@ -48,7 +48,8 @@
     "alert|buy|15m-buy-1789774200000",
     "alert|buy|15m-buy-1789833600000",
     "alert|buy|15m-buy-1789814700000",
-    "alert|buy|15m-buy-1789752600000"
+    "alert|buy|15m-buy-1789752600000",
+    "alert|buy|15m-buy-1789874100000"
   ],
   "log": [
     {
@@ -214,8 +215,12 @@
     {
       "t": 1789886063058,
       "type": "signal"
+    },
+    {
+      "t": 1789891058648,
+      "type": "alert"
     }
   ],
   "lastStatus": "2026-09-19",
-  "lastAlertAt": 1789872841720
+  "lastAlertAt": 1789891058648
 }
